@@ -1,0 +1,20 @@
+# Build artifacts
+*.exe
+*.out
+*.test
+
+# Local runtime files
+*.log
+*.pid
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
+
+# Task/watch local scripts
+task.ps1
+
+# Go caches/IDE
+.vscode/
+.idea/
