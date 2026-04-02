@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -102,28 +101,13 @@ func main() {
 
 func cmdAnchor(args []string) error {
 	fs := flag.NewFlagSet("anchor", flag.ContinueOnError)
-	volume := fs.String("volume", "D", "volume letter")
+	volumesRaw := fs.String("volumes", "D", "comma-separated volume letters, example: D,E")
 	dbPath := fs.String("db", "everything_mvp.db", "sqlite path")
-	allowSystem := fs.Bool("allow-system-volume", false, "allow C:")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	v, err := normalizeVolume(*volume)
-	if err != nil {
-		return err
-	}
-	if err := guardSystemVolume(v, *allowSystem); err != nil {
-		return err
-	}
-
-	h, err := openVolumeReadonly(v)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(h)
-
-	jd, err := queryUSNJournal(h)
+	volumes, err := parseVolumes(*volumesRaw)
 	if err != nil {
 		return err
 	}
@@ -137,27 +121,39 @@ func cmdAnchor(args []string) error {
 		return err
 	}
 
-	scope := string(v)
-	if err := upsertMeta(db, scope, "volume", scope); err != nil {
-		return err
-	}
-	if err := upsertMeta(db, scope, "anchor_journal_id", fmt.Sprintf("%d", jd.USNJournalID)); err != nil {
-		return err
-	}
-	if err := upsertMeta(db, scope, "anchor_usn", fmt.Sprintf("%d", jd.NextUSN)); err != nil {
-		return err
-	}
-	if _, err := getMeta(db, scope, "last_usn"); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			if err := upsertMeta(db, scope, "last_usn", fmt.Sprintf("%d", jd.NextUSN)); err != nil {
-				return err
-			}
-		} else {
+	for _, v := range volumes {
+		h, err := openVolumeReadonly(v)
+		if err != nil {
 			return err
 		}
-	}
+		jd, err := queryUSNJournal(h)
+		_ = windows.CloseHandle(h)
+		if err != nil {
+			return err
+		}
 
-	fmt.Printf("anchor saved: volume=%c journal_id=%d anchor_usn=%d db=%s\n", v, jd.USNJournalID, jd.NextUSN, *dbPath)
+		scope := string(v)
+		if err := upsertMeta(db, scope, "volume", scope); err != nil {
+			return err
+		}
+		if err := upsertMeta(db, scope, "anchor_journal_id", fmt.Sprintf("%d", jd.USNJournalID)); err != nil {
+			return err
+		}
+		if err := upsertMeta(db, scope, "anchor_usn", fmt.Sprintf("%d", jd.NextUSN)); err != nil {
+			return err
+		}
+		if _, err := getMeta(db, scope, "last_usn"); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if err := upsertMeta(db, scope, "last_usn", fmt.Sprintf("%d", jd.NextUSN)); err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+
+		fmt.Printf("anchor saved: volume=%c journal_id=%d anchor_usn=%d db=%s\n", v, jd.USNJournalID, jd.NextUSN, *dbPath)
+	}
 	return nil
 }
 
@@ -174,41 +170,20 @@ type snapshotEntry struct {
 
 func cmdFullBuild(args []string) error {
 	fs := flag.NewFlagSet("full-build", flag.ContinueOnError)
-	volume := fs.String("volume", "D", "volume letter")
+	volumesRaw := fs.String("volumes", "D", "comma-separated volume letters, example: D,E")
 	dbPath := fs.String("db", "everything_mvp.db", "sqlite path")
 	maxRecords := fs.Int("max-records", 50_000_000, "max records")
 	chunkSize := fs.Int("chunk-size", 1024*1024, "DeviceIoControl output buffer")
-	allowSystem := fs.Bool("allow-system-volume", false, "allow C:")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	v, err := normalizeVolume(*volume)
+	volumes, err := parseVolumes(*volumesRaw)
 	if err != nil {
-		return err
-	}
-	if err := guardSystemVolume(v, *allowSystem); err != nil {
 		return err
 	}
 
 	started := time.Now()
-	h, err := openVolumeReadonly(v)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(h)
-
-	jd, err := queryUSNJournal(h)
-	if err != nil {
-		return err
-	}
-
-	records, err := enumUSNAll(h, 0, jd.NextUSN, *maxRecords, uint32(*chunkSize))
-	if err != nil {
-		return err
-	}
-	entries, unresolved := buildSnapshotEntries(v, records)
-
 	db, err := openDB(*dbPath)
 	if err != nil {
 		return err
@@ -217,13 +192,42 @@ func cmdFullBuild(args []string) error {
 	if err := initDB(db); err != nil {
 		return err
 	}
-	if err := writeFullSnapshot(db, v, jd, entries); err != nil {
-		return err
+
+	var totalRaw, totalSnapshot, totalUnresolved int
+	for _, v := range volumes {
+		h, err := openVolumeReadonly(v)
+		if err != nil {
+			return err
+		}
+		jd, err := queryUSNJournal(h)
+		if err != nil {
+			_ = windows.CloseHandle(h)
+			return err
+		}
+
+		records, err := enumUSNAll(h, 0, jd.NextUSN, *maxRecords, uint32(*chunkSize))
+		_ = windows.CloseHandle(h)
+		if err != nil {
+			return err
+		}
+
+		for i := range records {
+			records[i] = qualifyRecord(v, records[i])
+		}
+		entries, unresolved := buildSnapshotEntries(v, records)
+		if err := writeFullSnapshot(db, v, jd, entries); err != nil {
+			return err
+		}
+
+		totalRaw += len(records)
+		totalSnapshot += len(entries)
+		totalUnresolved += unresolved
+		fmt.Printf("full-build volume=%c raw=%d snapshot=%d unresolved=%d\n", v, len(records), len(entries), unresolved)
 	}
 
 	fmt.Printf(
-		"Go full-build -> SQLite complete: raw=%d snapshot=%d unresolved_parents=%d in %.2fs -> %s\n",
-		len(records), len(entries), unresolved, time.Since(started).Seconds(), *dbPath,
+		"Go full-build -> SQLite complete: volumes=%d raw=%d snapshot=%d unresolved_parents=%d in %.2fs -> %s\n",
+		len(volumes), totalRaw, totalSnapshot, totalUnresolved, time.Since(started).Seconds(), *dbPath,
 	)
 	return nil
 }
@@ -234,22 +238,17 @@ func cmdRebuild(args []string) error {
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	volume := fs.String("volume", "D", "volume letter")
+	volumesRaw := fs.String("volumes", "D", "comma-separated volume letters, example: D,E")
 	dbPath := fs.String("db", "everything_mvp.db", "sqlite path")
 	addr := fs.String("addr", "127.0.0.1:7788", "listen addr")
-	pollSeconds := fs.Int("poll-seconds", 1, "poll interval")
 	flushSeconds := fs.Int("flush-seconds", 10, "flush interval")
 	chunkSize := fs.Int("chunk-size", 1024*1024, "DeviceIoControl output buffer")
-	allowSystem := fs.Bool("allow-system-volume", false, "allow C:")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	v, err := normalizeVolume(*volume)
+	volumes, err := parseVolumes(*volumesRaw)
 	if err != nil {
-		return err
-	}
-	if err := guardSystemVolume(v, *allowSystem); err != nil {
 		return err
 	}
 
@@ -261,165 +260,115 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	h, err := openVolumeReadonly(v)
-	if err != nil {
-		return err
-	}
-
-	jd, err := queryUSNJournal(h)
-	if err != nil {
-		windows.CloseHandle(h)
-		return err
-	}
-
-	scope := string(v)
-	startUSN, err := resolveStartUSN(db, scope, jd)
-	if err != nil {
-		_ = markNeedsRebuild(db, scope, fmt.Sprintf("startup journal mismatch: %v", err))
-		windows.CloseHandle(h)
-		return err
-	}
-
-	_ = clearNeedsRebuild(db, scope)
-
-	if err := upsertMeta(db, scope, "usn_journal_id", fmt.Sprintf("%d", jd.USNJournalID)); err != nil {
-		windows.CloseHandle(h)
-		return err
-	}
-
-	st := &daemonState{
-		db:             db,
-		volume:         v,
-		currentUSN:     startUSN,
-		journalID:      jd.USNJournalID,
-		journalNextUSN: jd.NextUSN,
-		pendingLatest:  map[string]usnRecord{},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		defer windows.CloseHandle(h)
-		pollTicker := time.NewTicker(time.Duration(*pollSeconds) * time.Second)
-		defer pollTicker.Stop()
-		flushTicker := time.NewTicker(time.Duration(*flushSeconds) * time.Second)
-		defer flushTicker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-pollTicker.C:
-				jlive, err := queryUSNJournal(h)
-				if err != nil {
-					log.Printf("query journal error: %v", err)
-					continue
-				}
-				if jlive.USNJournalID != st.journalID {
-					reason := fmt.Sprintf("journal changed: old=%d new=%d", st.journalID, jlive.USNJournalID)
-					log.Printf("rebuild required: %s", reason)
-					st.mu.Lock()
-					st.rebuildRequired = true
-					st.rebuildReason = reason
-					st.journalNextUSN = jlive.NextUSN
-					st.mu.Unlock()
-					_ = markNeedsRebuild(st.db, string(st.volume), reason)
-					continue
-				}
-				nextUSN, recs, err := readUSNBatch(h, st.currentUSN, st.journalID, uint32(*chunkSize))
-				if err != nil {
-					if isRebuildRequiredUSNError(err) {
-						reason := fmt.Sprintf("journal continuity lost: %v", err)
-						log.Printf("rebuild required: %s", reason)
-						st.mu.Lock()
-						st.rebuildRequired = true
-						st.rebuildReason = reason
-						st.mu.Unlock()
-						_ = markNeedsRebuild(st.db, string(st.volume), reason)
-						continue
-					}
-					log.Printf("poll error: %v", err)
-					continue
-				}
-				st.mu.Lock()
-				st.currentUSN = nextUSN
-				st.journalNextUSN = jlive.NextUSN
-				for _, r := range recs {
-					prev, ok := st.pendingLatest[r.ID]
-					if !ok || r.USN >= prev.USN {
-						st.pendingLatest[r.ID] = r
-					}
-				}
-				st.mu.Unlock()
-			case <-flushTicker.C:
-				if err := flushPending(st); err != nil {
-					log.Printf("flush error: %v", err)
-				}
-			}
+	states := make(map[rune]*daemonState, len(volumes))
+	for _, v := range volumes {
+		h, err := openVolumeReadonly(v)
+		if err != nil {
+			return err
 		}
-	}()
+		jd, err := queryUSNJournal(h)
+		if err != nil {
+			_ = windows.CloseHandle(h)
+			return err
+		}
+
+		scope := string(v)
+		startUSN, err := resolveStartUSN(db, scope, jd)
+		if err != nil {
+			_ = markNeedsRebuild(db, scope, fmt.Sprintf("startup journal mismatch: %v", err))
+			_ = windows.CloseHandle(h)
+			return err
+		}
+
+		_ = clearNeedsRebuild(db, scope)
+		if err := upsertMeta(db, scope, "usn_journal_id", fmt.Sprintf("%d", jd.USNJournalID)); err != nil {
+			_ = windows.CloseHandle(h)
+			return err
+		}
+
+		st := &daemonState{
+			db:             db,
+			volume:         v,
+			currentUSN:     startUSN,
+			journalID:      jd.USNJournalID,
+			journalNextUSN: jd.NextUSN,
+			pendingLatest:  map[string]usnRecord{},
+		}
+		states[v] = st
+
+		go runVolumeLoop(st, h, uint32(*chunkSize), time.Duration(*flushSeconds)*time.Second)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		st.mu.Lock()
-		lag := st.journalNextUSN - st.currentUSN
-		if lag < 0 {
-			lag = 0
+		for _, st := range states {
+			st.mu.Lock()
+			lag := st.journalNextUSN - st.currentUSN
+			if lag < 0 {
+				lag = 0
+			}
+			lastFlush := ""
+			if !st.lastFlushAt.IsZero() {
+				lastFlush = st.lastFlushAt.Format(time.RFC3339)
+			}
+			rebuildRequired := st.rebuildRequired
+			rebuildReason := st.rebuildReason
+			current := st.currentUSN
+			jid := st.journalID
+			jnext := st.journalNextUSN
+			platest := len(st.pendingLatest)
+			st.mu.Unlock()
+			lastUSN, _ := getMeta(st.db, string(st.volume), "last_usn")
+			_, _ = fmt.Fprintf(
+				w,
+				"ok volume=%c journal_id=%d journal_next_usn=%d current_usn=%d last_usn=%s lag=%d pending_latest=%d last_flush_time=%s rebuild_required=%t rebuild_reason=%q\n",
+				st.volume, jid, jnext, current, lastUSN, lag, platest, lastFlush, rebuildRequired, rebuildReason,
+			)
 		}
-		lastFlush := ""
-		if !st.lastFlushAt.IsZero() {
-			lastFlush = st.lastFlushAt.Format(time.RFC3339)
-		}
-		rebuildRequired := st.rebuildRequired
-		rebuildReason := st.rebuildReason
-		current := st.currentUSN
-		jid := st.journalID
-		jnext := st.journalNextUSN
-		platest := len(st.pendingLatest)
-		defer st.mu.Unlock()
-		lastUSN, _ := getMeta(st.db, string(st.volume), "last_usn")
-		_, _ = fmt.Fprintf(
-			w,
-			"ok volume=%c journal_id=%d journal_next_usn=%d current_usn=%d last_usn=%s lag=%d pending_latest=%d last_flush_time=%s rebuild_required=%t rebuild_reason=%q\n",
-			st.volume, jid, jnext, current, lastUSN, lag, platest, lastFlush, rebuildRequired, rebuildReason,
-		)
 	})
 	mux.HandleFunc("/flush", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if err := flushPending(st); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprintf(w, "flush failed: %v\n", err)
-			return
+		for _, st := range states {
+			if err := flushPending(st); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = fmt.Fprintf(w, "flush failed: %v\n", err)
+				return
+			}
 		}
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
-		st.mu.Lock()
-		rebuildRequired := st.rebuildRequired
-		rebuildReason := st.rebuildReason
-		st.mu.Unlock()
-		if rebuildRequired {
-			w.WriteHeader(http.StatusConflict)
-			_, _ = fmt.Fprintf(w, "rebuild required: %s\n", rebuildReason)
-			return
+		for _, st := range states {
+			st.mu.Lock()
+			rebuildRequired := st.rebuildRequired
+			rebuildReason := st.rebuildReason
+			st.mu.Unlock()
+			if rebuildRequired {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = fmt.Fprintf(w, "rebuild required on volume %c: %s\n", st.volume, rebuildReason)
+				return
+			}
 		}
-		if err := flushPending(st); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprintf(w, "flush failed: %v\n", err)
-			return
+		for _, st := range states {
+			if err := flushPending(st); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = fmt.Fprintf(w, "flush failed: %v\n", err)
+				return
+			}
 		}
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		matchMode := normalizeMatchMode(r.URL.Query().Get("mode"))
+		typeMode := normalizeTypeModeDefaultFile(r.URL.Query().Get("type"))
 		limit := 50
 		if v := r.URL.Query().Get("limit"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				limit = n
 			}
 		}
-		paths, err := queryEntries(st.db, q, limit)
+		paths, err := queryEntries(db, q, limit, matchMode, typeMode)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = fmt.Fprintf(w, "query failed: %v\n", err)
@@ -430,8 +379,75 @@ func cmdServe(args []string) error {
 		}
 	})
 
-	log.Printf("serve started: addr=%s volume=%c current_usn=%d", *addr, v, startUSN)
+	log.Printf("serve started: addr=%s volumes=%v", *addr, volumes)
 	return http.ListenAndServe(*addr, mux)
+}
+
+func runVolumeLoop(st *daemonState, h windows.Handle, chunkSize uint32, flushEvery time.Duration) {
+	defer windows.CloseHandle(h)
+	if flushEvery <= 0 {
+		flushEvery = 10 * time.Second
+	}
+	nextFlush := time.Now().Add(flushEvery)
+
+	for {
+		jlive, err := queryUSNJournal(h)
+		if err != nil {
+			log.Printf("volume %c query journal error: %v", st.volume, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		if jlive.USNJournalID != st.journalID {
+			reason := fmt.Sprintf("journal changed: old=%d new=%d", st.journalID, jlive.USNJournalID)
+			log.Printf("volume %c rebuild required: %s", st.volume, reason)
+			st.mu.Lock()
+			st.rebuildRequired = true
+			st.rebuildReason = reason
+			st.journalNextUSN = jlive.NextUSN
+			st.mu.Unlock()
+			_ = markNeedsRebuild(st.db, string(st.volume), reason)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		nextUSN, recs, err := readUSNBatch(h, st.currentUSN, st.journalID, chunkSize)
+		if err != nil {
+			if isRebuildRequiredUSNError(err) {
+				reason := fmt.Sprintf("journal continuity lost: %v", err)
+				log.Printf("volume %c rebuild required: %s", st.volume, reason)
+				st.mu.Lock()
+				st.rebuildRequired = true
+				st.rebuildReason = reason
+				st.mu.Unlock()
+				_ = markNeedsRebuild(st.db, string(st.volume), reason)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			log.Printf("volume %c poll error: %v", st.volume, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		st.mu.Lock()
+		st.currentUSN = nextUSN
+		st.journalNextUSN = jlive.NextUSN
+		for _, r := range recs {
+			rq := qualifyRecord(st.volume, r)
+			prev, ok := st.pendingLatest[rq.ID]
+			if !ok || rq.USN >= prev.USN {
+				st.pendingLatest[rq.ID] = rq
+			}
+		}
+		st.mu.Unlock()
+
+		if time.Now().After(nextFlush) {
+			if err := flushPending(st); err != nil {
+				log.Printf("volume %c flush error: %v", st.volume, err)
+			}
+			nextFlush = time.Now().Add(flushEvery)
+		}
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func cmdSearch(args []string) error {
@@ -439,6 +455,8 @@ func cmdSearch(args []string) error {
 	addr := fs.String("addr", "http://127.0.0.1:7788", "daemon base url")
 	query := fs.String("query", "", "query")
 	limit := fs.Int("limit", 50, "limit")
+	match := fs.String("match", "name", "match mode: name|path|all")
+	typ := fs.String("type", "file", "type filter: file|dir|all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -446,7 +464,16 @@ func cmdSearch(args []string) error {
 		return fmt.Errorf("--query is required")
 	}
 
-	u := fmt.Sprintf("%s/search?q=%s&limit=%d", strings.TrimRight(*addr, "/"), url.QueryEscape(*query), *limit)
+	mode := normalizeMatchMode(*match)
+	typeMode := normalizeTypeModeDefaultFile(*typ)
+	u := fmt.Sprintf(
+		"%s/search?q=%s&limit=%d&mode=%s&type=%s",
+		strings.TrimRight(*addr, "/"),
+		url.QueryEscape(*query),
+		*limit,
+		url.QueryEscape(mode),
+		url.QueryEscape(typeMode),
+	)
 	resp, err := http.Get(u)
 	if err != nil {
 		return err
@@ -648,7 +675,8 @@ func writeFullSnapshot(db *sql.DB, volume rune, jd journalData, entries []snapsh
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(`DELETE FROM entries`); err != nil {
+	prefix := fmt.Sprintf("%c|%%", volume)
+	if _, err := tx.Exec(`DELETE FROM entries WHERE id LIKE ?`, prefix); err != nil {
 		return err
 	}
 
@@ -797,9 +825,47 @@ func derivePath(volume rune, parentPath, existingPath, name string) string {
 	return fmt.Sprintf("%c:\\%s", volume, name)
 }
 
-func queryEntries(db *sql.DB, query string, limit int) ([]string, error) {
-	terms := strings.Fields(strings.ToLower(query))
-	rows, err := db.Query(`SELECT path, name FROM entries`)
+func queryEntries(db *sql.DB, query string, limit int, matchMode, typeMode string) ([]string, error) {
+	terms := strings.Fields(strings.TrimSpace(query))
+	if limit <= 0 {
+		limit = 50
+	}
+	mode := normalizeMatchMode(matchMode)
+	typ := normalizeTypeModeDefaultFile(typeMode)
+
+	sqlStr := `SELECT path FROM entries`
+	args := make([]any, 0, len(terms)*2+1)
+	clauses := make([]string, 0, len(terms)+1)
+
+	if typ == "file" {
+		clauses = append(clauses, "is_dir = 0")
+	} else if typ == "dir" {
+		clauses = append(clauses, "is_dir = 1")
+	}
+
+	if len(terms) > 0 {
+		for _, term := range terms {
+			pat := "%" + term + "%"
+			switch mode {
+			case "path":
+				clauses = append(clauses, `(path LIKE ? COLLATE NOCASE)`)
+				args = append(args, pat)
+			case "all":
+				clauses = append(clauses, `(name LIKE ? COLLATE NOCASE OR path LIKE ? COLLATE NOCASE)`)
+				args = append(args, pat, pat)
+			default:
+				clauses = append(clauses, `(name LIKE ? COLLATE NOCASE)`)
+				args = append(args, pat)
+			}
+		}
+	}
+	if len(clauses) > 0 {
+		sqlStr += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	sqlStr += " LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := db.Query(sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -807,27 +873,37 @@ func queryEntries(db *sql.DB, query string, limit int) ([]string, error) {
 
 	hits := make([]string, 0, limit)
 	for rows.Next() {
-		var path, name string
-		if err := rows.Scan(&path, &name); err != nil {
+		var path string
+		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		pl := strings.ToLower(path)
-		nl := strings.ToLower(name)
-		ok := true
-		for _, t := range terms {
-			if !strings.Contains(pl, t) && !strings.Contains(nl, t) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			hits = append(hits, path)
-			if len(hits) >= limit {
-				break
-			}
-		}
+		hits = append(hits, path)
 	}
 	return hits, rows.Err()
+}
+
+func normalizeMatchMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "path":
+		return "path"
+	case "all":
+		return "all"
+	default:
+		return "name"
+	}
+}
+
+func normalizeTypeModeDefaultFile(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "file":
+		return "file"
+	case "dir":
+		return "dir"
+	case "all":
+		return "all"
+	default:
+		return "file"
+	}
 }
 
 func resolveStartUSN(db *sql.DB, scope string, jd journalData) (int64, error) {
@@ -865,6 +941,33 @@ func getMeta(db *sql.DB, scope, key string) (string, error) {
 	var v string
 	err := db.QueryRow(`SELECT value FROM meta WHERE scope=? AND key=? LIMIT 1`, scope, key).Scan(&v)
 	return v, err
+}
+
+func parseVolumes(raw string) ([]rune, error) {
+	parts := strings.Split(raw, ",")
+	seen := map[rune]bool{}
+	out := make([]rune, 0, len(parts))
+	for _, p := range parts {
+		v, err := normalizeVolume(strings.TrimSpace(p))
+		if err != nil {
+			return nil, err
+		}
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid volumes provided")
+	}
+	return out, nil
+}
+
+func qualifyRecord(volume rune, r usnRecord) usnRecord {
+	q := r
+	q.ID = fmt.Sprintf("%c|%s", volume, r.ID)
+	q.ParentID = fmt.Sprintf("%c|%s", volume, r.ParentID)
+	return q
 }
 
 func markNeedsRebuild(db *sql.DB, scope, reason string) error {
