@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -69,11 +70,13 @@ type daemonState struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: everything-go-mvp <anchor|full-build|rebuild|serve|search>")
+		fmt.Print(cliUsage())
 		os.Exit(2)
 	}
 
 	switch os.Args[1] {
+	case "help", "--help", "-h":
+		fmt.Print(cliUsage())
 	case "anchor":
 		if err := cmdAnchor(os.Args[2:]); err != nil {
 			log.Fatal(err)
@@ -95,9 +98,56 @@ func main() {
 			log.Fatal(err)
 		}
 	default:
-		fmt.Println("unknown command, use anchor|full-build|rebuild|serve|search")
+		fmt.Print(cliUsage())
 		os.Exit(2)
 	}
+}
+
+func cliUsage() string {
+	return strings.TrimSpace(`
+usage: everything-go-mvp <anchor|full-build|rebuild|serve|search|help>
+
+search examples:
+  everything-go-mvp search --contains rg.exe
+  everything-go-mvp search --like "%rg%" --field all --type all --limit 20
+
+http endpoints:
+  GET  /
+  GET  /help
+  GET  /status
+  POST /flush
+  GET  /search?contains=keyword
+  GET  /search?like=%25keyword%25&field=all&type=all&limit=20
+` + "\n")
+}
+
+func httpHelpText() string {
+	return strings.TrimSpace(`
+FastNTFS HTTP API
+
+endpoints:
+  GET  /         this help text
+  GET  /help     this help text
+  GET  /status   daemon status
+  POST /flush    flush pending journal changes
+  GET  /search   search indexed entries
+
+search params:
+  contains=text          substring shortcut, rewritten to LIKE '%text%'
+  like=pattern           raw SQL LIKE pattern, e.g. '%x%', '%x', 'x%'
+  field=name|path|all    default: name
+  type=file|dir|all      default: file
+  limit=50               default: 50
+  format=text|json       default: text
+
+notes:
+  contains and like are mutually exclusive
+
+examples:
+  /search?contains=rg.exe
+  /search?like=%25a%20%20a%25&field=all&type=all&limit=20
+  /search?contains=rg.exe&format=json
+` + "\n")
 }
 
 func cmdAnchor(args []string) error {
@@ -241,7 +291,7 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	volumesRaw := fs.String("volumes", "D", "comma-separated volume letters, example: D,E")
 	dbPath := fs.String("db", "everything_mvp.db", "sqlite path")
-	addr := fs.String("addr", "127.0.0.1:7788", "listen addr")
+	addr := fs.String("addr", "127.0.0.1:12345", "listen addr")
 	flushSeconds := fs.Int("flush-seconds", 10, "flush interval")
 	chunkSize := fs.Int("chunk-size", 1024*1024, "DeviceIoControl output buffer")
 	deltaLog := fs.Bool("delta-log", false, "log every applied add/update/delete delta")
@@ -303,6 +353,18 @@ func cmdServe(args []string) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, httpHelpText())
+	})
+	mux.HandleFunc("/help", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, httpHelpText())
+	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		for _, st := range states {
 			st.mu.Lock()
@@ -362,21 +424,41 @@ func cmdServe(args []string) error {
 				return
 			}
 		}
-		q := strings.TrimSpace(r.URL.Query().Get("q"))
-		matchMode := normalizeMatchMode(r.URL.Query().Get("mode"))
+		pattern, err := resolveSearchPattern(r.URL.Query().Get("like"), r.URL.Query().Get("contains"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, "%v\n", err)
+			return
+		}
+		matchMode := normalizeMatchMode(r.URL.Query().Get("field"))
 		typeMode := normalizeTypeModeDefaultFile(r.URL.Query().Get("type"))
+		format := normalizeSearchFormat(r.URL.Query().Get("format"))
 		limit := 50
 		if v := r.URL.Query().Get("limit"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				limit = n
 			}
 		}
-		paths, err := queryEntries(db, q, limit, matchMode, typeMode)
+		paths, err := queryEntries(db, pattern, limit, matchMode, typeMode)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = fmt.Fprintf(w, "query failed: %v\n", err)
 			return
 		}
+		if format == "json" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items":  paths,
+				"count":  len(paths),
+				"field":  matchMode,
+				"type":   typeMode,
+				"limit":  limit,
+				"format": "json",
+				"like":   pattern,
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		for _, p := range paths {
 			_, _ = fmt.Fprintln(w, p)
 		}
@@ -455,24 +537,26 @@ func runVolumeLoop(st *daemonState, h windows.Handle, chunkSize uint32, flushEve
 
 func cmdSearch(args []string) error {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
-	addr := fs.String("addr", "http://127.0.0.1:7788", "daemon base url")
-	query := fs.String("query", "", "query")
+	addr := fs.String("addr", "http://127.0.0.1:12345", "daemon base url")
 	limit := fs.Int("limit", 50, "limit")
-	match := fs.String("match", "name", "match mode: name|path|all")
+	field := fs.String("field", "name", "search field: name|path|all")
+	like := fs.String("like", "", "raw SQL LIKE pattern")
+	contains := fs.String("contains", "", "substring shortcut, internally rewritten to %value%")
 	typ := fs.String("type", "file", "type filter: file|dir|all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*query) == "" {
-		return fmt.Errorf("--query is required")
+	pattern, err := resolveSearchPattern(*like, *contains)
+	if err != nil {
+		return err
 	}
 
-	mode := normalizeMatchMode(*match)
+	mode := normalizeMatchMode(*field)
 	typeMode := normalizeTypeModeDefaultFile(*typ)
 	u := fmt.Sprintf(
-		"%s/search?q=%s&limit=%d&mode=%s&type=%s",
+		"%s/search?like=%s&limit=%d&field=%s&type=%s",
 		strings.TrimRight(*addr, "/"),
-		url.QueryEscape(*query),
+		url.QueryEscape(pattern),
 		*limit,
 		url.QueryEscape(mode),
 		url.QueryEscape(typeMode),
@@ -890,8 +974,8 @@ func derivePath(volume rune, parentPath, existingPath, name string) string {
 	return fmt.Sprintf("%c:\\%s", volume, name)
 }
 
-func queryEntries(db *sql.DB, query string, limit int, matchMode, typeMode string) ([]string, error) {
-	terms := strings.Fields(strings.TrimSpace(query))
+func queryEntries(db *sql.DB, pattern string, limit int, matchMode, typeMode string) ([]string, error) {
+	pattern = strings.TrimSpace(pattern)
 	if limit <= 0 {
 		limit = 50
 	}
@@ -899,8 +983,8 @@ func queryEntries(db *sql.DB, query string, limit int, matchMode, typeMode strin
 	typ := normalizeTypeModeDefaultFile(typeMode)
 
 	sqlStr := `SELECT path FROM entries`
-	args := make([]any, 0, len(terms)*2+1)
-	clauses := make([]string, 0, len(terms)+1)
+	args := make([]any, 0, 3)
+	clauses := make([]string, 0, 2)
 
 	if typ == "file" {
 		clauses = append(clauses, "is_dir = 0")
@@ -908,20 +992,17 @@ func queryEntries(db *sql.DB, query string, limit int, matchMode, typeMode strin
 		clauses = append(clauses, "is_dir = 1")
 	}
 
-	if len(terms) > 0 {
-		for _, term := range terms {
-			pat := "%" + term + "%"
-			switch mode {
-			case "path":
-				clauses = append(clauses, `(path LIKE ? COLLATE NOCASE)`)
-				args = append(args, pat)
-			case "all":
-				clauses = append(clauses, `(name LIKE ? COLLATE NOCASE OR path LIKE ? COLLATE NOCASE)`)
-				args = append(args, pat, pat)
-			default:
-				clauses = append(clauses, `(name LIKE ? COLLATE NOCASE)`)
-				args = append(args, pat)
-			}
+	if pattern != "" {
+		switch mode {
+		case "path":
+			clauses = append(clauses, `(path LIKE ? COLLATE NOCASE)`)
+			args = append(args, pattern)
+		case "all":
+			clauses = append(clauses, `(name LIKE ? COLLATE NOCASE OR path LIKE ? COLLATE NOCASE)`)
+			args = append(args, pattern, pattern)
+		default:
+			clauses = append(clauses, `(name LIKE ? COLLATE NOCASE)`)
+			args = append(args, pattern)
 		}
 	}
 	if len(clauses) > 0 {
@@ -956,6 +1037,31 @@ func normalizeMatchMode(raw string) string {
 	default:
 		return "name"
 	}
+}
+
+func normalizeSearchFormat(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "json":
+		return "json"
+	default:
+		return "text"
+	}
+}
+
+func resolveSearchPattern(rawLike, rawContains string) (string, error) {
+	like := strings.TrimSpace(rawLike)
+	contains := strings.TrimSpace(rawContains)
+
+	if like != "" && contains != "" {
+		return "", fmt.Errorf("--like and --contains are mutually exclusive")
+	}
+	if like != "" {
+		return like, nil
+	}
+	if contains != "" {
+		return "%" + contains + "%", nil
+	}
+	return "", fmt.Errorf("either --like or --contains is required")
 }
 
 func normalizeTypeModeDefaultFile(raw string) string {

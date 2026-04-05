@@ -3,7 +3,7 @@ param(
   [string]$InstallDir = "$env:ProgramData\FastNTFS",
   [string]$BinDir = "$HOME\bin",
   [string]$Volumes = "",
-  [string]$Address = "127.0.0.1:7788",
+  [string]$Address = "127.0.0.1:12345",
   [int]$FlushSeconds = 10,
   [int]$MaxRecords = 50000000,
   [switch]$SkipRebuild,
